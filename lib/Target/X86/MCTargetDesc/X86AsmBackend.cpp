@@ -9,6 +9,7 @@
 
 #include "MCTargetDesc/X86BaseInfo.h"
 #include "MCTargetDesc/X86FixupKinds.h"
+#include "MCTargetDesc/X86MCNaCl.h" // @LOCALMOD
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCELFObjectWriter.h"
@@ -26,13 +27,6 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
-
-// Option to allow disabling arithmetic relaxation to workaround PR9807, which
-// is useful when running bitwise comparison experiments on Darwin. We should be
-// able to remove this once PR9807 is resolved.
-static cl::opt<bool>
-MCDisableArithRelaxation("mc-x86-disable-arith-relaxation",
-         cl::desc("Disable relaxation of arithmetic instruction for X86"));
 
 static unsigned getFixupKindLog2Size(unsigned Kind) {
   switch (Kind) {
@@ -112,12 +106,19 @@ public:
     assert(Fixup.getOffset() + Size <= DataSize &&
            "Invalid fixup offset!");
 
+    // @LOCALMOD-BEGIN
+    // This check breaks negative addends on x86-32.  It makes x86-32
+    // behaviour inconsistent with x86-64 and ARM.
+    // See: https://code.google.com/p/nativeclient/issues/detail?id=3548
+#if 0
     // Check that uppper bits are either all zeros or all ones.
     // Specifically ignore overflow/underflow as long as the leakage is
     // limited to the lower bits. This is to remain compatible with
     // other assemblers.
     assert(isIntN(Size * 8 + 1, Value) &&
            "Value does not fit in the Fixup field");
+#endif
+    // @LOCALMOD-END
 
     for (unsigned i = 0; i != Size; ++i)
       Data[Fixup.getOffset() + i] = uint8_t(Value >> (i * 8));
@@ -241,29 +242,18 @@ bool X86AsmBackend::mayNeedRelaxation(const MCInst &Inst) const {
   if (getRelaxedOpcodeBranch(Inst.getOpcode()) != Inst.getOpcode())
     return true;
 
-  if (MCDisableArithRelaxation)
-    return false;
-
   // Check if this instruction is ever relaxable.
   if (getRelaxedOpcodeArith(Inst.getOpcode()) == Inst.getOpcode())
     return false;
 
 
-  // Check if it has an expression and is not RIP relative.
-  bool hasExp = false;
-  bool hasRIP = false;
-  for (unsigned i = 0; i < Inst.getNumOperands(); ++i) {
-    const MCOperand &Op = Inst.getOperand(i);
-    if (Op.isExpr())
-      hasExp = true;
+  // Check if the relaxable operand has an expression. For the current set of
+  // relaxable instructions, the relaxable operand is always the last operand.
+  unsigned RelaxableOp = Inst.getNumOperands() - 1;
+  if (Inst.getOperand(RelaxableOp).isExpr())
+    return true;
 
-    if (Op.isReg() && Op.getReg() == X86::RIP)
-      hasRIP = true;
-  }
-
-  // FIXME: Why exactly do we need the !hasRIP? Is it just a limitation on
-  // how we do relaxations?
-  return hasExp && !hasRIP;
+  return false;
 }
 
 bool X86AsmBackend::fixupNeedsRelaxation(const MCFixup &Fixup,
@@ -385,6 +375,46 @@ public:
     return createX86ELFObjectWriter(OS, /*IsELF64*/ true, OSABI, ELF::EM_X86_64);
   }
 };
+
+// @LOCALMOD-BEGIN
+class NaClX86_32AsmBackend : public ELFX86_32AsmBackend {
+public:
+  NaClX86_32AsmBackend(const Target &T, uint8_t OSABI, StringRef CPU)
+      : ELFX86_32AsmBackend(T, OSABI, CPU),
+        STI(X86_MC::createX86MCSubtargetInfo("i386-unknown-nacl", CPU, "")) {
+    State.PrefixSaved = 0;
+    State.EmitRaw = false;
+  }
+  ~NaClX86_32AsmBackend() override {}
+
+  bool CustomExpandInst(const MCInst &Inst, MCStreamer &Out) override {
+    return CustomExpandInstNaClX86(*STI, Inst, Out, State);
+  }
+
+private:
+  std::unique_ptr<MCSubtargetInfo> STI;
+  X86MCNaClSFIState State;
+};
+
+class NaClX86_64AsmBackend : public ELFX86_64AsmBackend {
+public:
+  NaClX86_64AsmBackend(const Target &T, uint8_t OSABI, StringRef CPU)
+      : ELFX86_64AsmBackend(T, OSABI, CPU),
+        STI(X86_MC::createX86MCSubtargetInfo("x86_64-unknown-nacl", CPU, "")) {
+    State.PrefixSaved = 0;
+    State.EmitRaw = false;
+  }
+  ~NaClX86_64AsmBackend() override {}
+
+  bool CustomExpandInst(const MCInst &Inst, MCStreamer &Out) override {
+    return CustomExpandInstNaClX86(*STI, Inst, Out, State);
+  }
+
+private:
+  std::unique_ptr<MCSubtargetInfo> STI;
+  X86MCNaClSFIState State;
+};
+// @LOCALMOD-END
 
 class WindowsX86AsmBackend : public X86AsmBackend {
   bool Is64Bit;
@@ -799,6 +829,10 @@ MCAsmBackend *llvm::createX86_32AsmBackend(const Target &T,
     return new WindowsX86AsmBackend(T, false, CPU);
 
   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TheTriple.getOS());
+  // @LOCALMOD-BEGIN
+  if (TheTriple.isOSNaCl())
+    return new NaClX86_32AsmBackend(T, OSABI, CPU);
+  // @LOCALMOD-END
   return new ELFX86_32AsmBackend(T, OSABI, CPU);
 }
 
@@ -821,6 +855,10 @@ MCAsmBackend *llvm::createX86_64AsmBackend(const Target &T,
 
   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TheTriple.getOS());
 
+  // @LOCALMOD-BEGIN
+  if (TheTriple.isOSNaCl())
+    return new NaClX86_64AsmBackend(T, OSABI, CPU);
+  // @LOCALMOD-END
   if (TheTriple.getEnvironment() == Triple::GNUX32)
     return new ELFX86_X32AsmBackend(T, OSABI, CPU);
   return new ELFX86_64AsmBackend(T, OSABI, CPU);

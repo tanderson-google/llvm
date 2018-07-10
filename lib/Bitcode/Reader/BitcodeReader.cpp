@@ -138,7 +138,7 @@ class BitcodeReader : public GVMaterializer {
   std::unique_ptr<MemoryBuffer> Buffer;
   std::unique_ptr<BitstreamReader> StreamFile;
   BitstreamCursor Stream;
-  DataStreamer *LazyStreamer;
+  StreamingMemoryObject *LazyStreamer; // @LOCALMOD
   uint64_t NextUnreadBit;
   bool SeenValueSymbolTable;
 
@@ -228,7 +228,7 @@ public:
 
   explicit BitcodeReader(MemoryBuffer *buffer, LLVMContext &C,
                          DiagnosticHandlerFunction DiagnosticHandler);
-  explicit BitcodeReader(DataStreamer *streamer, LLVMContext &C,
+  explicit BitcodeReader(StreamingMemoryObject *streamer, LLVMContext &C, // @LOCALMOD
                          DiagnosticHandlerFunction DiagnosticHandler);
   ~BitcodeReader() override { FreeState(); }
 
@@ -429,7 +429,8 @@ BitcodeReader::BitcodeReader(MemoryBuffer *buffer, LLVMContext &C,
       MDValueList(C), SeenFirstFunctionBody(false), UseRelativeIDs(false),
       WillMaterializeAllForwardRefs(false), IsMetadataMaterialized(false) {}
 
-BitcodeReader::BitcodeReader(DataStreamer *streamer, LLVMContext &C,
+// @LOCALMOD:StreamingMemoryObject
+BitcodeReader::BitcodeReader(StreamingMemoryObject *streamer, LLVMContext &C,
                              DiagnosticHandlerFunction DiagnosticHandler)
     : Context(C), DiagnosticHandler(getDiagHandler(DiagnosticHandler, C)),
       TheModule(nullptr), Buffer(nullptr), LazyStreamer(streamer),
@@ -4456,13 +4457,13 @@ std::error_code BitcodeReader::InitStreamFromBuffer() {
 std::error_code BitcodeReader::InitLazyStream() {
   // Check and strip off the bitcode wrapper; BitstreamReader expects never to
   // see it.
-  auto OwnedBytes = llvm::make_unique<StreamingMemoryObject>(LazyStreamer);
-  StreamingMemoryObject &Bytes = *OwnedBytes;
+  // @LOCALMOD Bytes -> LazyStreamer
+  std::unique_ptr<StreamingMemoryObject> OwnedBytes(LazyStreamer);
   StreamFile = llvm::make_unique<BitstreamReader>(std::move(OwnedBytes));
   Stream.init(&*StreamFile);
 
   unsigned char buf[16];
-  if (Bytes.readBytes(buf, 16, 0) != 16)
+  if (LazyStreamer->readBytes(buf, 16, 0) != 16)
     return Error("Invalid bitcode signature");
 
   if (!isBitcode(buf, buf + 16))
@@ -4472,8 +4473,8 @@ std::error_code BitcodeReader::InitLazyStream() {
     const unsigned char *bitcodeStart = buf;
     const unsigned char *bitcodeEnd = buf + 16;
     SkipBitcodeWrapperHeader(bitcodeStart, bitcodeEnd, false);
-    Bytes.dropLeadingBytes(bitcodeStart - buf);
-    Bytes.setKnownObjectSize(bitcodeEnd - bitcodeStart);
+    LazyStreamer->dropLeadingBytes(bitcodeStart - buf);
+    LazyStreamer->setKnownObjectSize(bitcodeEnd - bitcodeStart);
   }
   return std::error_code();
 }
@@ -4553,7 +4554,7 @@ llvm::getLazyBitcodeModule(std::unique_ptr<MemoryBuffer> &&Buffer,
 }
 
 ErrorOr<std::unique_ptr<Module>>
-llvm::getStreamedBitcodeModule(StringRef Name, DataStreamer *Streamer,
+llvm::getStreamedBitcodeModule(StringRef Name, StreamingMemoryObject *Streamer, // @LOCALMOD
                                LLVMContext &Context,
                                DiagnosticHandlerFunction DiagnosticHandler) {
   std::unique_ptr<Module> M = make_unique<Module>(Name, Context);

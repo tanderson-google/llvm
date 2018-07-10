@@ -346,6 +346,13 @@ MipsTargetLowering::MipsTargetLowering(const MipsTargetMachine &TM,
   setOperationAction(ISD::VACOPY,            MVT::Other, Expand);
   setOperationAction(ISD::VAEND,             MVT::Other, Expand);
 
+  // @LOCALMOD-BEGIN
+  if (Subtarget.isTargetNaCl())
+    setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::Other, Custom);
+  else
+    setOperationAction(ISD::INTRINSIC_WO_CHAIN, MVT::i64, Custom);
+  // @LOCALMOD-END
+
   // Use the default for now
   setOperationAction(ISD::STACKSAVE,         MVT::Other, Expand);
   setOperationAction(ISD::STACKRESTORE,      MVT::Other, Expand);
@@ -1664,6 +1671,16 @@ SDValue MipsTargetLowering::lowerBlockAddress(SDValue Op,
   return getAddrLocal(N, SDLoc(N), Ty, DAG, ABI.IsN32() || ABI.IsN64());
 }
 
+// @LOCALMOD-BEGIN
+SDValue MipsTargetLowering::
+GetNaClThreadPointer(SelectionDAG &DAG, SDLoc DL) const {
+  SDValue ThreadPointer = DAG.getRegister(Mips::T8, getPointerTy());
+  return DAG.getLoad(getPointerTy(), DL,
+                     DAG.getEntryNode(), ThreadPointer,
+                     MachinePointerInfo(), false, false, false, 0);
+}
+// @LOCALMOD-END
+
 SDValue MipsTargetLowering::
 lowerGlobalTLSAddress(SDValue Op, SelectionDAG &DAG) const
 {
@@ -1677,6 +1694,27 @@ lowerGlobalTLSAddress(SDValue Op, SelectionDAG &DAG) const
   EVT PtrVT = getPointerTy();
 
   TLSModel::Model model = getTargetMachine().getTLSModel(GV);
+
+  // @LOCALMOD-BEGIN
+  if (Subtarget.isTargetNaCl()) {
+    SDVTList VTs = DAG.getVTList(MVT::i32);
+    SDValue TGAHi = DAG.getTargetGlobalAddress(GV, DL, MVT::i32, 0,
+                                                 MipsII::MO_TPREL_HI);
+    SDValue TGALo = DAG.getTargetGlobalAddress(GV, DL, MVT::i32, 0,
+                                                 MipsII::MO_TPREL_LO);
+    SDValue Hi = DAG.getNode(MipsISD::Hi, DL, VTs, TGAHi);
+    SDValue Lo = DAG.getNode(MipsISD::Lo, DL, MVT::i32, TGALo);
+    SDValue Offset = DAG.getNode(ISD::ADD, DL, MVT::i32, Hi, Lo);
+
+    SDValue ThreadPointer = GetNaClThreadPointer(DAG, DL);
+    // tprel_hi and tprel_lo relocations expect that thread pointer is offset
+    // by 0x7000 from the start of the TLS data area.
+    SDValue TPOffset = DAG.getConstant(0x7000, MVT::i32);
+    SDValue ThreadPointer2 = DAG.getNode(ISD::ADD, DL, PtrVT, ThreadPointer,
+                                         TPOffset);
+    return DAG.getNode(ISD::ADD, DL, PtrVT, ThreadPointer2, Offset);
+  }
+  // @LOCALMOD-END
 
   if (model == TLSModel::GeneralDynamic || model == TLSModel::LocalDynamic) {
     // General Dynamic and Local Dynamic TLS Model.

@@ -23,6 +23,7 @@
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/Bitcode/NaCl/NaClBitcodeWriterPass.h" // @LOCALMOD
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
@@ -51,6 +52,8 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/MinSFI.h"  // @LOCALMOD
+#include "llvm/Transforms/NaCl.h"  // @LOCALMOD
 #include <algorithm>
 #include <memory>
 using namespace llvm;
@@ -135,6 +138,22 @@ static cl::opt<bool>
 OptLevelO3("O3",
            cl::desc("Optimization level 3. Similar to clang -O3"));
 
+// @LOCALMOD-BEGIN
+static cl::opt<bool>
+PNaClABISimplifyPreOpt(
+    "pnacl-abi-simplify-preopt",
+    cl::desc("PNaCl ABI simplifications for before optimizations"));
+
+static cl::opt<bool>
+PNaClABISimplifyPostOpt(
+    "pnacl-abi-simplify-postopt",
+    cl::desc("PNaCl ABI simplifications for after optimizations"));
+
+static cl::opt<bool>
+MinSFI("minsfi",
+       cl::desc("MinSFI sandboxing"));
+// @LOCALMOD-END
+
 static cl::opt<std::string>
 TargetTriple("mtriple", cl::desc("Override target triple for module"));
 
@@ -184,6 +203,18 @@ static cl::opt<bool> PreserveBitcodeUseListOrder(
     "preserve-bc-uselistorder",
     cl::desc("Preserve use-list order when writing LLVM bitcode."),
     cl::init(true), cl::Hidden);
+// @LOCALMOD-BEGIN
+static cl::opt<NaClFileFormat>
+OutputFileFormat(
+    "bitcode-format",
+    cl::desc("Define format of generated bitcode file:"),
+    cl::values(
+        clEnumValN(LLVMFormat, "llvm", "LLVM bitcode file (default)"),
+        clEnumValN(PNaClFormat, "pnacl", "PNaCl bitcode file"),
+        clEnumValEnd),
+    cl::init(LLVMFormat));
+extern bool OutputFileFormatIsPNaCl;
+// @LOCALMOD-END
 
 static cl::opt<bool> PreserveAssemblyUseListOrder(
     "preserve-ll-uselistorder",
@@ -266,6 +297,14 @@ static CodeGenOpt::Level GetCodeGenOptLevel() {
 // Returns the TargetMachine instance or zero if no triple is provided.
 static TargetMachine* GetTargetMachine(Triple TheTriple) {
   std::string Error;
+  // @LOCALMOD-BEGIN: Some optimization passes like SimplifyCFG do nice
+  // things for code size, but only do it if the TTI says it is okay.
+  // For now, use the ARM TTI for LE32 until we have an LE32 TTI.
+  // https://code.google.com/p/nativeclient/issues/detail?id=2554
+  if (TheTriple.getArch() == Triple::le32) {
+    TheTriple.setArchName("armv7a");
+  }
+  // @LOCALMOD-END
   const Target *TheTarget = TargetRegistry::lookupTarget(MArch, TheTriple,
                                                          Error);
   // Some modules don't specify a triple, and this is okay.
@@ -351,6 +390,60 @@ int main(int argc, char **argv) {
 #ifdef LINK_POLLY_INTO_TOOLS
   polly::initializePollyPasses(Registry);
 #endif
+
+  // @LOCALMOD-BEGIN
+  initializeAddPNaClExternalDeclsPass(Registry);
+  initializeAllocateDataSegmentPass(Registry);
+  initializeBackendCanonicalizePass(Registry);
+  initializeCanonicalizeMemIntrinsicsPass(Registry);
+  initializeCleanupUsedGlobalsMetadataPass(Registry);
+  initializeClearPtrToIntTop32Pass(Registry);
+  initializeConstantInsertExtractElementIndexPass(Registry);
+  initializeConvertToPSOPass(Registry);
+  initializeExpandAllocasPass(Registry);
+  initializeExpandArithWithOverflowPass(Registry);
+  initializeExpandByValPass(Registry);
+  initializeExpandConstantExprPass(Registry);
+  initializeExpandCtorsPass(Registry);
+  initializeExpandGetElementPtrPass(Registry);
+  initializeExpandIndirectBrPass(Registry);
+  initializeExpandLargeIntegersPass(Registry);
+  initializeExpandShuffleVectorPass(Registry);
+  initializeExpandSmallArgumentsPass(Registry);
+  initializeExpandStructRegsPass(Registry);
+  initializeExpandTlsConstantExprPass(Registry);
+  initializeExpandTlsPass(Registry);
+  initializeExpandVarArgsPass(Registry);
+  initializeFixVectorLoadStoreAlignmentPass(Registry);
+  initializeFlattenGlobalsPass(Registry);
+  initializeGlobalCleanupPass(Registry);
+  initializeGlobalizeConstantVectorsPass(Registry);
+  initializeInsertDivideCheckPass(Registry);
+  initializeInternalizeUsedGlobalsPass(Registry);
+  initializeNormalizeAlignmentPass(Registry);
+  initializePNaClABIVerifyFunctionsPass(Registry);
+  initializePNaClABIVerifyModulePass(Registry);
+  initializePNaClSjLjEHPass(Registry);
+  initializePromoteI1OpsPass(Registry);
+  initializePromoteIntegersPass(Registry);
+  initializeRemoveAsmMemoryPass(Registry);
+  initializeRenameEntryPointPass(Registry);
+  initializeReplacePtrsWithIntsPass(Registry);
+  initializeResolveAliasesPass(Registry);
+  initializeResolvePNaClIntrinsicsPass(Registry);
+  initializeRewriteAtomicsPass(Registry);
+  initializeRewriteLLVMIntrinsicsPass(Registry);
+  initializeRewritePNaClLibraryCallsPass(Registry);
+  initializeSandboxIndirectCallsPass(Registry);
+  initializeSandboxMemoryAccessesPass(Registry);
+  initializeSimplifyAllocasPass(Registry);
+  initializeSimplifyStructRegSignaturesPass(Registry);
+  initializeStripAttributesPass(Registry);
+  initializeStripMetadataPass(Registry);
+  initializeStripModuleFlagsPass(Registry);
+  initializeStripTlsPass(Registry);
+  initializeSubstituteUndefsPass(Registry);
+  // @LOCALMOD-END
 
   cl::ParseCommandLineOptions(argc, argv,
     "llvm .bc -> .bc modular optimizer and analysis printer\n");
@@ -490,6 +583,14 @@ int main(int argc, char **argv) {
 
   // Create a new optimization pass for each one specified on the command line
   for (unsigned i = 0; i < PassList.size(); ++i) {
+    // @LOCALMOD-BEGIN
+    if (PNaClABISimplifyPreOpt &&
+        PNaClABISimplifyPreOpt.getPosition() < PassList.getPosition(i)) {
+      PNaClABISimplifyAddPreOptPasses(&ModuleTriple, Passes);
+      PNaClABISimplifyPreOpt = false;
+    }
+    // @LOCALMOD-END
+
     if (StandardLinkOpts &&
         StandardLinkOpts.getPosition() < PassList.getPosition(i)) {
       AddStandardLinkPasses(Passes);
@@ -520,6 +621,19 @@ int main(int argc, char **argv) {
       AddOptimizationPasses(Passes, *FPasses, 3, 0);
       OptLevelO3 = false;
     }
+
+    // @LOCALMOD-BEGIN
+    if (PNaClABISimplifyPostOpt &&
+        PNaClABISimplifyPostOpt.getPosition() < PassList.getPosition(i)) {
+      PNaClABISimplifyAddPostOptPasses(&ModuleTriple, Passes);
+      PNaClABISimplifyPostOpt = false;
+    }
+
+    if (MinSFI && MinSFI.getPosition() < PassList.getPosition(i)) {
+      MinSFIPasses(Passes);
+      MinSFI = false;
+    }
+    // @LOCALMOD-END
 
     const PassInfo *PassInf = PassList[i];
     Pass *P = nullptr;
@@ -563,6 +677,11 @@ int main(int argc, char **argv) {
           createPrintModulePass(errs(), "", PreserveAssemblyUseListOrder));
   }
 
+  // @LOCALMOD-BEGIN
+  if (PNaClABISimplifyPreOpt)
+    PNaClABISimplifyAddPreOptPasses(&ModuleTriple, Passes);
+  // @LOCALMOD-END
+
   if (StandardLinkOpts) {
     AddStandardLinkPasses(Passes);
     StandardLinkOpts = false;
@@ -590,6 +709,14 @@ int main(int argc, char **argv) {
     FPasses->doFinalization();
   }
 
+  // @LOCALMOD-BEGIN
+  if (PNaClABISimplifyPostOpt)
+    PNaClABISimplifyAddPostOptPasses(&ModuleTriple, Passes);
+
+  if (MinSFI)
+     MinSFIPasses(Passes);
+  // @LOCALMOD-END
+
   // Check that the module is well formed on completion of optimization
   if (!NoVerify && !VerifyEach)
     Passes.add(createVerifierPass());
@@ -600,8 +727,19 @@ int main(int argc, char **argv) {
       Passes.add(
           createPrintModulePass(Out->os(), "", PreserveAssemblyUseListOrder));
     else
-      Passes.add(
-          createBitcodeWriterPass(Out->os(), PreserveBitcodeUseListOrder));
+      // @LOCALMOD-START
+      switch (OutputFileFormat) {
+      case LLVMFormat:
+        Passes.add(createBitcodeWriterPass(Out->os(), PreserveBitcodeUseListOrder));
+        break;
+      case PNaClFormat:
+        Passes.add(createNaClBitcodeWriterPass(Out->os()));
+        break;
+      case AutodetectFileFormat:
+        report_fatal_error("Command can't autodetect file format!");
+        break;
+      }
+      // @LOCALMOD-END
   }
 
   // Before executing passes, print the final values of the LLVM options.

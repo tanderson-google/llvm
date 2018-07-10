@@ -17,6 +17,7 @@
 #include "X86FrameLowering.h"
 #include "X86InstrBuilder.h"
 #include "X86MachineFunctionInfo.h"
+#include "X86NaClDecls.h" // @LOCALMOD
 #include "X86Subtarget.h"
 #include "X86TargetMachine.h"
 #include "llvm/ADT/BitVector.h"
@@ -167,20 +168,36 @@ X86RegisterInfo::getPointerRegClass(const MachineFunction &MF,
   switch (Kind) {
   default: llvm_unreachable("Unexpected Kind in getPointerRegClass!");
   case 0: // Normal GPRs.
-    if (Subtarget.isTarget64BitLP64())
+    // @LOCALMOD -- NaCl is ILP32, but 32-bit pointers become 64-bit
+    // after sandboxing (clobbers a full 64-bit reg).
+    if (Subtarget.isTarget64BitLP64() || Subtarget.isTargetNaCl64())
       return &X86::GR64RegClass;
     return &X86::GR32RegClass;
   case 1: // Normal GPRs except the stack pointer (for encoding reasons).
-    if (Subtarget.isTarget64BitLP64())
+    // @LOCALMOD -- NaCl is ILP32, but 32-bit pointers become 64-bit
+    // after sandboxing (clobbers a full 64-bit reg).
+    if (Subtarget.isTarget64BitLP64() || Subtarget.isTargetNaCl64())
       return &X86::GR64_NOSPRegClass;
     return &X86::GR32_NOSPRegClass;
-  case 2: // Available for tailcall (not callee-saved GPRs).
-    if (IsWin64)
+  case 2: // NOREX GPRs.
+    // @LOCALMOD -- NaCl is ILP32, but 32-bit pointers become 64-bit
+    // after sandboxing (clobbers a full 64-bit reg).
+    if (Subtarget.isTarget64BitLP64() || Subtarget.isTargetNaCl64())
+      return &X86::GR64_NOREXRegClass;
+    return &X86::GR32_NOREXRegClass;
+  case 3: // NOREX GPRs except the stack pointer (for encoding reasons).
+    // @LOCALMOD -- NaCl is ILP32, but 32-bit pointers become 64-bit
+    // after sandboxing (clobbers a full 64-bit reg).
+    if (Subtarget.isTarget64BitLP64() || Subtarget.isTargetNaCl64())
+      return &X86::GR64_NOREX_NOSPRegClass;
+    return &X86::GR32_NOREX_NOSPRegClass;
+  case 4: // Available for tailcall (not callee-saved GPRs).
+    const Function *F = MF.getFunction();
+    if (IsWin64 || (F && F->getCallingConv() == CallingConv::X86_64_Win64))
       return &X86::GR64_TCW64RegClass;
     else if (Is64Bit)
       return &X86::GR64_TCRegClass;
 
-    const Function *F = MF.getFunction();
     bool hasHipeCC = (F ? F->getCallingConv() == CallingConv::HiPE : false);
     if (hasHipeCC)
       return &X86::GR32RegClass;
@@ -268,9 +285,17 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
     break;
   }
 
+  bool IsNaCl = Subtarget.isTargetNaCl(); // @LOCALMOD
   if (Is64Bit) {
     if (IsWin64)
       return CSR_Win64_SaveList;
+    // @LOCALMOD-BEGIN
+    if (IsNaCl) {
+      if (CallsEHReturn)
+        return CSR_NaCl64EHRet_SaveList;
+      return CSR_NaCl64_SaveList;
+    }
+    // @LOCALMOD-END
     if (CallsEHReturn)
       return CSR_64EHRet_SaveList;
     return CSR_64_SaveList;
@@ -415,6 +440,34 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
         Reserved.set(*AI);
     }
   }
+
+  // @LOCALMOD-START
+  const X86Subtarget& Subtarget = MF.getSubtarget<X86Subtarget>();
+  const bool RestrictR15 = FlagRestrictR15;
+  assert(FlagUseZeroBasedSandbox || RestrictR15);
+  if (Subtarget.isTargetNaCl64()) {
+    if (RestrictR15) {
+      Reserved.set(X86::R15);
+      Reserved.set(X86::R15D);
+      Reserved.set(X86::R15W);
+      Reserved.set(X86::R15B);
+    }
+    Reserved.set(X86::RBP);
+    Reserved.set(X86::EBP);
+    Reserved.set(X86::BP);
+    Reserved.set(X86::BPL);
+    const bool RestrictR11 = FlagHideSandboxBase && !FlagUseZeroBasedSandbox;
+    if (RestrictR11) {
+      // Restrict r11 so that it can be used for indirect jump
+      // sequences that don't leak the sandbox base address onto the
+      // stack.
+      Reserved.set(X86::R11);
+      Reserved.set(X86::R11D);
+      Reserved.set(X86::R11W);
+      Reserved.set(X86::R11B);
+    }
+  }
+  // @LOCALMOD-END
 
   return Reserved;
 }
@@ -714,6 +767,9 @@ unsigned getX86SubSuperRegister(unsigned Reg, MVT::SimpleValueType VT,
       return X86::R14D;
     case X86::R15B: case X86::R15W: case X86::R15D: case X86::R15:
       return X86::R15D;
+    // @LOCALMOD. TODO: possibly revert this after LEA .td fixes
+    case X86::EIP: case X86::RIP:
+      return X86::EIP;
     }
   case MVT::i64:
     switch (Reg) {
@@ -750,6 +806,9 @@ unsigned getX86SubSuperRegister(unsigned Reg, MVT::SimpleValueType VT,
       return X86::R14;
     case X86::R15B: case X86::R15W: case X86::R15D: case X86::R15:
       return X86::R15;
+    // @LOCALMOD. TODO: possibly revert this after LEA .td fixes
+    case X86::EIP: case X86::RIP:
+      return X86::RIP;
     }
   }
 }

@@ -36,7 +36,11 @@ namespace llvm {
       WrapperPIC,   // WrapperPIC - A wrapper node for TargetGlobalAddress in
                     // PIC mode.
       WrapperJT,    // WrapperJT - A wrapper node for TargetJumpTable
-
+      // @LOCALMOD-START
+      WrapperJT2,   // like WrapperJT but without the UID
+      WrapperGOT,   // A Wrapper node for GOT addresses
+      EH_RETURN,    // For LowerEH_RETURN
+      // @LOCALMOD-END
       // Add pseudo op to model memcpy for struct byval.
       COPY_STRUCT_BYVAL,
 
@@ -475,6 +479,11 @@ namespace llvm {
     SDValue LowerToTLSExecModels(GlobalAddressSDNode *GA,
                                  SelectionDAG &DAG,
                                  TLSModel::Model model) const;
+    // @LOCALMOD-START
+    SDValue LowerJumpTable(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerEH_RETURN(SDValue Op, SelectionDAG &DAG) const;
+    // @LOCALMOD-END
+
     SDValue LowerGLOBAL_OFFSET_TABLE(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerBR_JT(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerXALUO(SDValue Op, SelectionDAG &DAG) const;
@@ -614,6 +623,7 @@ namespace llvm {
     FastISel *createFastISel(FunctionLoweringInfo &funcInfo,
                              const TargetLibraryInfo *libInfo);
   }
+
 }
 
 #endif  // ARMISELLOWERING_H

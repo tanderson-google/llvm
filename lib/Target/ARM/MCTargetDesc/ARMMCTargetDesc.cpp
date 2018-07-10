@@ -14,6 +14,7 @@
 #include "ARMBaseInfo.h"
 #include "ARMMCAsmInfo.h"
 #include "ARMMCTargetDesc.h"
+#include "ARMMCNaClExpander.h" // @LOCALMOD
 #include "InstPrinter/ARMInstPrinter.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/MC/MCCodeGenInfo.h"
@@ -381,6 +382,16 @@ static MCInstrAnalysis *createARMMCInstrAnalysis(const MCInstrInfo *Info) {
   return new ARMMCInstrAnalysis(Info);
 }
 
+// @LOCALMOD-START
+static void createARMMCNaClExpander(MCStreamer &S,
+                                    std::unique_ptr<MCRegisterInfo> &&RegInfo,
+                                    std::unique_ptr<MCInstrInfo> &&InstInfo) {
+  auto *Exp = new ARM::ARMMCNaClExpander(S.getContext(), std::move(RegInfo),
+                                         std::move(InstInfo));
+  S.setNaClExpander(Exp);
+}
+// @LOCALMOD-END
+
 // Force static initialization.
 extern "C" void LLVMInitializeARMTargetMC() {
   for (Target *T : {&TheARMLETarget, &TheARMBETarget, &TheThumbLETarget,
@@ -405,8 +416,13 @@ extern "C" void LLVMInitializeARMTargetMC() {
     TargetRegistry::RegisterMCInstrAnalysis(*T, createARMMCInstrAnalysis);
 
     TargetRegistry::RegisterELFStreamer(*T, createELFStreamer);
+#ifndef __native_client__
     TargetRegistry::RegisterCOFFStreamer(*T, createARMWinCOFFStreamer);
     TargetRegistry::RegisterMachOStreamer(*T, createARMMachOStreamer);
+#endif
+    // @LOCALMOD-START
+    TargetRegistry::RegisterMCNaClExpander(*T, createARMMCNaClExpander);
+    // @LOCALMOD-END
 
     // Register the obj target streamer.
     TargetRegistry::RegisterObjectTargetStreamer(*T,

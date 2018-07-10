@@ -15,19 +15,24 @@
 #include "llvm/Config/config.h" // plugin-api.h requires HAVE_STDINT_H
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Analysis/NaCl.h" // @LOCALMOD
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Bitcode/NaCl/NaClBitcodeWriterPass.h" // @LOCALMOD
+#include "llvm/Bitcode/NaCl/NaClReaderWriter.h" // @LOCALMOD
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/IR/AutoUpgrade.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfo.h" // @LOCALMOD
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/InitializePasses.h" // @LOCALMOD
 #include "llvm/Linker/Linker.h"
 #include "llvm/MC/SubtargetFeature.h"
 #include "llvm/Object/IRObjectFile.h"
@@ -39,6 +44,8 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/NaCl.h" // @LOCALMOD
+#include "llvm/Transforms/MinSFI.h" // @LOCALMOD
 #include "llvm/Transforms/Utils/GlobalStatus.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -77,10 +84,21 @@ static ld_plugin_set_extra_library_path set_extra_library_path = nullptr;
 static ld_plugin_get_view get_view = nullptr;
 static ld_plugin_message message = discard_message;
 static Reloc::Model RelocationModel = Reloc::Default;
+// @LOCALMOD-BEGIN
+static bool Relocatable = false;
+// @LOCALMOD-END
 static std::string output_name = "";
 static std::list<claimed_file> Modules;
 static std::vector<std::string> Cleanup;
 static llvm::TargetOptions TargetOpts;
+
+// @LOCALMOD-BEGIN
+// Callback for getting the number of --wrap'd symbols.
+static ld_plugin_get_num_wrapped get_num_wrapped = NULL;
+
+// Callback for getting the name of a wrapped symbol.
+static ld_plugin_get_wrapped get_wrapped = NULL;
+// @LOCALMOD-END
 
 namespace options {
   enum OutputType {
@@ -92,6 +110,12 @@ namespace options {
   static bool generate_api_file = false;
   static OutputType TheOutputType = OT_NORMAL;
   static unsigned OptLevel = 2;
+  // @LOCALMOD-BEGIN
+  static bool ABISimplify = true;
+  static bool ABIVerify = true;
+  static bool Finalize = true;
+  static bool MinSFI = false;
+  // @LOCALMOD-END
   static std::string obj_path;
   static std::string extra_library_path;
   static std::string triple;
@@ -129,6 +153,22 @@ namespace options {
       if (opt[1] < '0' || opt[1] > '3')
         report_fatal_error("Optimization level must be between 0 and 3");
       OptLevel = opt[1] - '0';
+      // @LOCALMOD-BEGIN
+    } else if (opt == "abi-simplify") {
+      ABISimplify = true;
+    } else if (opt == "no-abi-simplify") {
+      ABISimplify = false;
+    } else if (opt == "abi-verify") {
+      ABIVerify = true;
+    } else if (opt == "no-abi-verify") {
+      ABIVerify = false;
+    } else if (opt == "finalize") {
+      Finalize = true;
+    } else if (opt == "no-finalize") {
+      Finalize = false;
+    } else if (opt == "minsfi") {
+      MinSFI = true;
+      // @LOCALMOD-END
     } else {
       // Save this option to pass to the code generator.
       // ParseCommandLineOptions() expects argv[0] to be program name. Lazily
@@ -171,6 +211,9 @@ ld_plugin_status onload(ld_plugin_tv *tv) {
       case LDPT_LINKER_OUTPUT:
         switch (tv->tv_u.tv_val) {
           case LDPO_REL:  // .o
+            // @LOCALMOD-BEGIN
+            Relocatable = true;
+            // @LOCALMOD-END
           case LDPO_DYN:  // .so
           case LDPO_PIE:  // position independent executable
             RelocationModel = Reloc::PIC_;
@@ -232,6 +275,14 @@ ld_plugin_status onload(ld_plugin_tv *tv) {
       case LDPT_GET_VIEW:
         get_view = tv->tv_u.tv_get_view;
         break;
+      // @LOCALMOD-BEGIN
+      case LDPT_GET_WRAPPED:
+        get_wrapped = tv->tv_u.tv_get_wrapped;
+        break;
+      case LDPT_GET_NUM_WRAPPED:
+        get_num_wrapped = tv->tv_u.tv_get_num_wrapped;
+        break;
+      // @LOCALMOD-END
       case LDPT_MESSAGE:
         message = tv->tv_u.tv_message;
         break;
@@ -260,6 +311,17 @@ ld_plugin_status onload(ld_plugin_tv *tv) {
     message(LDPL_ERROR, "relesase_input_file not passed to LLVMgold.");
     return LDPS_ERR;
   }
+
+  // @LOCALMOD-BEGIN
+  if (options::Finalize && !options::ABISimplify) {
+    message(LDPL_FATAL, "Finalization requires ABI simplification.");
+    return LDPS_ERR;
+  }
+  if (options::MinSFI && !options::ABISimplify) {
+    message(LDPL_FATAL, "MinSFI requires ABI simplification.");
+    return LDPS_ERR;
+  }
+  // @LOCALMOD-END
 
   return LDPS_OK;
 }
@@ -734,11 +796,80 @@ static void runLTOPasses(Module &M, TargetMachine &TM) {
   passes.run(M);
 }
 
+// @LOCALMOD-BEGIN
+static void runSimplificationPasses(Module &M, Triple &TheTriple) {
+  legacy::PassManager Passes;
+
+  if (options::Finalize)
+    StripDebugInfo(M);
+
+  TargetLibraryInfoImpl TLII(TheTriple);
+  TLII.disableAllFunctions();
+  Passes.add(new TargetLibraryInfoWrapperPass(TLII));
+
+  PNaClABISimplifyAddPreOptPasses(&TheTriple, Passes);
+  PassManagerBuilder PMB;
+  PMB.LoopVectorize = false;
+  PMB.SLPVectorize = false;
+  PMB.OptLevel = options::OptLevel;
+  PMB.Inliner = createFunctionInliningPass(100);
+  PMB.populateLTOPassManager(Passes);
+  PNaClABISimplifyAddPostOptPasses(&TheTriple, Passes);
+
+  if (options::MinSFI)
+    MinSFIPasses(Passes);
+
+  if (options::Finalize) {
+    Passes.add(createStripSymbolsPass(false));
+    Passes.add(createStripMetadataPass());
+    Passes.add(createStripModuleFlagsPass());
+  }
+
+  Passes.add(createVerifierPass());
+
+  PNaClABIErrorReporter Reporter;
+
+  if (!options::Finalize)
+    PNaClABIAllowDebugMetadata = true;
+
+  if (options::ABIVerify) {
+    Passes.add(createPNaClABIVerifyModulePass(&Reporter));
+    Passes.add(createPNaClABIVerifyFunctionsPass(&Reporter));
+  }
+  
+  Passes.run(M);
+
+  if (options::ABIVerify && Reporter.getErrorCount() > 0) {
+    std::string Errors;
+    raw_string_ostream OS(Errors);
+    Reporter.printErrors(OS);
+    message(LDPL_FATAL, OS.str().c_str());
+  }
+}
+// @LOCALMOD-END
+
 static void saveBCFile(StringRef Path, Module &M) {
   std::error_code EC;
   raw_fd_ostream OS(Path, EC, sys::fs::OpenFlags::F_None);
   if (EC)
     message(LDPL_FATAL, "Failed to write the output file.");
+// @LOCALMOD-BEGIN
+  const std::string &TripleStr = M.getTargetTriple();
+  Triple TheTriple(TripleStr);
+  if (!Relocatable && (TheTriple.getArch() == Triple::le32 &&
+                       TheTriple.getOS() == Triple::NaCl)) {
+    if (unsigned NumOpts = options::extra.size())
+      cl::ParseCommandLineOptions(NumOpts, &options::extra[0]);
+
+    if (options::ABISimplify)
+      runSimplificationPasses(M, TheTriple);
+
+    if (options::Finalize)
+      NaClWriteBitcodeToFile(&M, OS, /* AcceptSupportedOnly */ true);
+    else
+      WriteBitcodeToFile(&M, OS, /* ShouldPreserveUseListOrder */ false);
+  } else
+// @LOCALMOD-END
   WriteBitcodeToFile(&M, OS, /* ShouldPreserveUseListOrder */ true);
 }
 
@@ -820,6 +951,34 @@ static void codegen(Module &M) {
     Cleanup.push_back(Filename.c_str());
 }
 
+// @LOCALMOD-BEGIN
+static void wrapSymbol(Module *M, const char *sym) {
+  std::string wrapSymName("__wrap_");
+  wrapSymName += sym;
+  std::string realSymName("__real_");
+  realSymName += sym;
+
+  Constant *SymGV = M->getNamedValue(sym);
+
+  // Replace uses of "sym" with "__wrap_sym".
+  if (SymGV) {
+    Constant *WrapGV = M->getNamedValue(wrapSymName);
+    if (!WrapGV)
+      WrapGV = M->getOrInsertGlobal(wrapSymName, SymGV->getType());
+    SymGV->replaceAllUsesWith(
+        ConstantExpr::getBitCast(WrapGV, SymGV->getType()));
+  }
+
+  // Replace uses of "__real_sym" with "sym".
+  if (Constant *RealGV = M->getNamedValue(realSymName)) {
+    if (!SymGV)
+      SymGV = M->getOrInsertGlobal(sym, RealGV->getType());
+    RealGV->replaceAllUsesWith(
+        ConstantExpr::getBitCast(SymGV, RealGV->getType()));
+  }
+}
+// @LOCALMOD-END
+
 /// gold informs us that all symbols have been read. At this point, we use
 /// get_symbols to see if any of our definitions have been overridden by a
 /// native object file. Then, perform optimization and codegen.
@@ -869,6 +1028,23 @@ static ld_plugin_status allSymbolsReadHook(raw_fd_ostream *ApiFile) {
     if (canBeOmittedFromSymbolTable(GV))
       internalize(*GV);
   }
+
+  // @LOCALMOD-BEGIN
+  // Perform symbol wrapping.
+  unsigned num_wrapped;
+  if ((*get_num_wrapped)(&num_wrapped) != LDPS_OK) {
+    (*message)(LDPL_ERROR, "Unable to get the number of wrapped symbols.");
+    return LDPS_ERR;
+  }
+  for (unsigned i = 0; i < num_wrapped; ++i) {
+    const char *sym;
+    if ((*get_wrapped)(i, &sym) != LDPS_OK) {
+      (*message)(LDPL_ERROR, "Unable to wrap symbol %u/%u.", i, num_wrapped);
+      return LDPS_ERR;
+    }
+    wrapSymbol(Combined.get(), sym);
+  }
+  // @LOCALMOD-END
 
   if (options::TheOutputType == options::OT_DISABLE)
     return LDPS_OK;

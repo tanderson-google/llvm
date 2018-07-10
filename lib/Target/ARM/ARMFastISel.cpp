@@ -490,6 +490,11 @@ unsigned ARMFastISel::ARMMaterializeFP(const ConstantFP *CFP, MVT VT) {
   // Require VFP2 for loading fp constants.
   if (!Subtarget->hasVFP2()) return false;
 
+  // @LOCALMOD-START
+  if (!Subtarget->useConstIslands())
+    return false;
+  // @LOCALMOD-END
+
   // MachineConstantPool wants an explicit alignment.
   unsigned Align = DL.getPrefTypeAlignment(CFP->getType());
   if (Align == 0) {
@@ -550,6 +555,11 @@ unsigned ARMFastISel::ARMMaterializeInt(const Constant *C, MVT VT) {
 
   if (ResultReg)
     return ResultReg;
+
+  // @LOCALMOD-START
+  // Should have been handled by fastEmit_i above.
+  assert(Subtarget->useConstIslands());
+  // @LOCALMOD-END
 
   // Load from constant pool.  For now 32-bit only.
   if (VT != MVT::i32)
@@ -613,6 +623,11 @@ unsigned ARMFastISel::ARMMaterializeGV(const GlobalValue *GV, MVT VT) {
     AddOptionalDefs(BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
                             TII.get(Opc), DestReg).addGlobalAddress(GV, 0, TF));
   } else {
+    // @LOCALMOD-BEGIN
+    if (!Subtarget->useConstIslands())
+      return 0;
+    // @LOCALMOD-END
+
     // MachineConstantPool wants an explicit alignment.
     unsigned Align = DL.getPrefTypeAlignment(GV->getType());
     if (Align == 0) {
@@ -1657,12 +1672,12 @@ bool ARMFastISel::SelectSelect(const Instruction *I) {
     if (Op2Reg == 0) return false;
   }
 
-  unsigned CmpOpc = isThumb2 ? ARM::t2CMPri : ARM::CMPri;
-  CondReg = constrainOperandRegClass(TII.get(CmpOpc), CondReg, 0);
+  unsigned TstOpc = isThumb2 ? ARM::t2TSTri : ARM::TSTri;
+  CondReg = constrainOperandRegClass(TII.get(TstOpc), CondReg, 0);
   AddOptionalDefs(
-      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(CmpOpc))
+      BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc, TII.get(TstOpc))
           .addReg(CondReg)
-          .addImm(0));
+          .addImm(1));
 
   unsigned MovCCOpc;
   const TargetRegisterClass *RC;
